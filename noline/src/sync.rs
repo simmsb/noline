@@ -6,6 +6,9 @@
 //! Use the [`crate::builder::EditorBuilder`] to build an editor.
 use ::core::marker::PhantomData;
 
+use embedded_hal::serial;
+use genawaiter::stack::Co;
+
 use crate::error::Error;
 use crate::history::{get_history_entries, CircularSlice, History};
 use crate::line_buffer::{Buffer, LineBuffer};
@@ -36,29 +39,33 @@ pub trait Write {
 /// Line editor for synchronous IO
 ///
 /// It is recommended to use [`crate::builder::EditorBuilder`] to build an Editor.
-pub struct Editor<B: Buffer, H: History, IO: Read + Write> {
+pub struct Editor<B: Buffer, H: History, RW: serial::Read<u8> + serial::Write<u8>> {
     buffer: LineBuffer<B>,
     terminal: Terminal,
     history: H,
-    _marker: PhantomData<IO>,
+    _marker: PhantomData<RW>,
 }
 
-impl<B, H, IO, RE, WE> Editor<B, H, IO>
+impl<B, H, RW, RE, WE> Editor<B, H, RW>
 where
     B: Buffer,
     H: History,
-    IO: Read<Error = RE> + Write<Error = WE>,
+    RW: serial::Read<u8, Error = RE> + serial::Write<u8, Error = WE>,
 {
     /// Create and initialize line editor
-    pub fn new(io: &mut IO) -> Result<Self, Error<RE, WE>> {
+    pub async fn new(
+        co: &mut Co<'_, ()>,
+        io: &mut embedded::IO<RW>,
+    ) -> Result<Self, Error<RE, WE>> {
         let mut initializer = Initializer::new();
 
-        io.write(Initializer::init())
+        io.write(co, Initializer::init())
+            .await
             .or_else(|err| Error::write_error(err))?;
-        io.flush().or_else(|err| Error::write_error(err))?;
+        io.flush(co).await.or_else(|err| Error::write_error(err))?;
 
         let terminal = loop {
-            let byte = io.read().or_else(|err| Error::read_error(err))?;
+            let byte = io.read(co).await.or_else(|err| Error::read_error(err))?;
 
             match initializer.advance(byte) {
                 InitializerResult::Continue => (),
@@ -75,13 +82,19 @@ where
         })
     }
 
-    fn handle_output<'b>(output: Output<'b, B>, io: &mut IO) -> Result<Option<()>, Error<RE, WE>> {
+    async fn handle_output<'b>(
+        co: &mut Co<'_, ()>,
+        output: Output<'b, B>,
+        io: &mut embedded::IO<RW>,
+    ) -> Result<Option<()>, Error<RE, WE>> {
         for item in output {
             if let Some(bytes) = item.get_bytes() {
-                io.write(bytes).or_else(|err| Error::write_error(err))?;
+                io.write(co, bytes)
+                    .await
+                    .or_else(|err| Error::write_error(err))?;
             }
 
-            io.flush().or_else(|err| Error::write_error(err))?;
+            io.flush(co).await.or_else(|err| Error::write_error(err))?;
 
             match item {
                 OutputItem::EndOfString => return Ok(Some(())),
@@ -94,10 +107,11 @@ where
     }
 
     /// Read line from `stdin`
-    pub fn readline<'b>(
+    pub async fn readline<'b>(
         &'b mut self,
+        co: &mut Co<'_, ()>,
         prompt: &'b str,
-        io: &mut IO,
+        io: &mut embedded::IO<RW>,
     ) -> Result<&'b str, Error<RE, WE>> {
         let mut line = Line::new(
             prompt,
@@ -105,11 +119,14 @@ where
             &mut self.terminal,
             &mut self.history,
         );
-        Self::handle_output(line.reset(), io)?;
+        Self::handle_output(co, line.reset(), io).await?;
 
         loop {
-            let byte = io.read().or_else(|err| Error::read_error(err))?;
-            if Self::handle_output(line.advance(byte), io)?.is_some() {
+            let byte = io.read(co).await.or_else(|err| Error::read_error(err))?;
+            if Self::handle_output(co, line.advance(byte), io)
+                .await?
+                .is_some()
+            {
                 break;
             }
         }
@@ -128,320 +145,24 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::builder::EditorBuilder;
-
-    use super::*;
-    use ::std::string::ToString;
-    use ::std::{thread, vec::Vec};
-    use crossbeam::channel::{unbounded, Receiver, Sender};
-
-    struct IO {
-        input: Receiver<u8>,
-        buffer: Vec<u8>,
-        output: Sender<u8>,
-    }
-
-    impl IO {
-        fn new(input: Receiver<u8>, output: Sender<u8>) -> Self {
-            Self {
-                input,
-                buffer: Vec::new(),
-                output,
-            }
-        }
-    }
-
-    impl Write for IO {
-        type Error = ();
-
-        fn write(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
-            dbg!(buf);
-            self.buffer.extend(buf.iter());
-
-            Ok(())
-        }
-
-        fn flush(&mut self) -> Result<(), Self::Error> {
-            for b in self.buffer.drain(0..) {
-                self.output.send(b).unwrap();
-            }
-
-            Ok(())
-        }
-    }
-
-    impl Read for IO {
-        type Error = ();
-
-        fn read(&mut self) -> Result<u8, Self::Error> {
-            Ok(self.input.recv().or_else(|_| Err(()))?)
-        }
-    }
-
-    #[test]
-    fn editor() {
-        let (input_tx, input_rx) = unbounded();
-        let (output_tx, output_rx) = unbounded();
-
-        let mut io = IO::new(input_rx, output_tx);
-
-        let handle = thread::spawn(move || {
-            let mut editor = EditorBuilder::new_unbounded().build_sync(&mut io).unwrap();
-
-            if let Ok(s) = editor.readline("> ", &mut io) {
-                Some(s.to_string())
-            } else {
-                None
-            }
-        });
-
-        for &b in Initializer::init() {
-            dbg!(b);
-            assert_eq!(
-                output_rx.recv_timeout(::core::time::Duration::from_millis(1000)),
-                Ok(b)
-            );
-        }
-
-        for &b in "\x1b[1;1R\x1b[20;80R".as_bytes() {
-            input_tx.send(b).unwrap();
-        }
-
-        for &b in "\r\x1b[J> \x1b[6n".as_bytes() {
-            dbg!(b);
-            assert_eq!(
-                output_rx.recv_timeout(::core::time::Duration::from_millis(1000)),
-                Ok(b)
-            );
-        }
-
-        for &b in "abc\r".as_bytes() {
-            input_tx.send(b).unwrap();
-        }
-
-        assert_eq!(handle.join().unwrap(), Some("abc".to_string()));
-    }
-}
-
-#[cfg(any(test, feature = "std"))]
-pub mod std {
-    //! IO implementation for `std`. Requires feature `std`.
-
-    use super::*;
-
-    use ::std::io;
-    use core::fmt;
-
-    /// IO wrapper for stdin and stdout
-
-    pub struct IO<R, W>
-    where
-        R: io::Read,
-        W: io::Write,
-    {
-        input: R,
-        output: W,
-    }
-
-    impl<R, W> IO<R, W>
-    where
-        R: io::Read,
-        W: io::Write,
-    {
-        /// Create IO wrapper from input and output
-        pub fn new(input: R, output: W) -> Self {
-            Self { input, output }
-        }
-
-        /// Consume wrapper and return input and output as tuple
-        pub fn take(self) -> (R, W) {
-            (self.input, self.output)
-        }
-    }
-
-    impl<R, W> Read for IO<R, W>
-    where
-        R: io::Read,
-        W: io::Write,
-    {
-        type Error = std::io::Error;
-
-        fn read(&mut self) -> Result<u8, Self::Error> {
-            let mut buf = [0];
-            self.input.read_exact(&mut buf)?;
-
-            Ok(buf[0])
-        }
-    }
-
-    impl<R, W> Write for IO<R, W>
-    where
-        R: io::Read,
-        W: io::Write,
-    {
-        type Error = std::io::Error;
-
-        fn write(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
-            self.output.write_all(buf)
-        }
-
-        fn flush(&mut self) -> Result<(), Self::Error> {
-            self.output.flush()
-        }
-    }
-
-    impl<R, W> fmt::Write for IO<R, W>
-    where
-        R: io::Read,
-        W: io::Write,
-    {
-        fn write_str(&mut self, s: &str) -> fmt::Result {
-            self.write(s.as_bytes()).or(Err(fmt::Error))
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use ::std::string::ToString;
-        use ::std::{thread, vec::Vec};
-
-        use crossbeam::channel::{unbounded, Receiver, Sender};
-
-        use crate::builder::EditorBuilder;
-        use crate::testlib::{test_cases, test_editor_with_case, MockTerminal};
-        use ::std::io::Read as IoRead;
-
-        use super::*;
-
-        struct MockStdout {
-            buffer: Vec<u8>,
-            tx: Sender<u8>,
-        }
-
-        impl MockStdout {
-            fn new(tx: Sender<u8>) -> Self {
-                Self {
-                    buffer: Vec::new(),
-                    tx,
-                }
-            }
-        }
-
-        struct MockStdin {
-            rx: Receiver<u8>,
-        }
-
-        impl MockStdin {
-            fn new(rx: Receiver<u8>) -> Self {
-                Self { rx }
-            }
-        }
-
-        struct MockIO {
-            stdin: MockStdin,
-            stdout: MockStdout,
-        }
-
-        impl MockIO {
-            fn new(stdin: MockStdin, stdout: MockStdout) -> Self {
-                Self { stdout, stdin }
-            }
-
-            fn from_terminal(terminal: &mut MockTerminal) -> Self {
-                let (tx, rx) = terminal.take_io();
-
-                Self::new(MockStdin::new(rx), MockStdout::new(tx.unwrap()))
-            }
-
-            fn get_pipes(self) -> (MockStdin, MockStdout) {
-                (self.stdin, self.stdout)
-            }
-        }
-
-        impl io::Read for MockStdin {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                for i in 0..(buf.len()) {
-                    match self.rx.recv() {
-                        Ok(byte) => buf[i] = byte,
-                        Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-                    }
-                }
-
-                Ok(buf.len())
-            }
-        }
-
-        impl io::Write for MockStdout {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.buffer.extend(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                for byte in self.buffer.drain(0..) {
-                    self.tx.send(byte).unwrap();
-                }
-
-                Ok(())
-            }
-        }
-
-        #[test]
-        fn mock_stdin() {
-            let (tx, rx) = unbounded();
-
-            let mut stdin = MockStdin::new(rx);
-
-            for i in 0..10 {
-                tx.send(i).unwrap();
-            }
-
-            for i in 0..10 {
-                let mut buf = [0];
-                stdin.read_exact(&mut buf).unwrap();
-
-                assert_eq!(buf[0], i);
-            }
-        }
-
-        #[test]
-        fn editor() {
-            let prompt = "> ";
-
-            for case in test_cases() {
-                test_editor_with_case(
-                    case,
-                    prompt,
-                    |term| MockIO::from_terminal(term).get_pipes(),
-                    |(stdin, stdout), string_tx| {
-                        thread::spawn(move || {
-                            let mut io = IO::new(stdin, stdout);
-                            let mut editor = EditorBuilder::new_unbounded()
-                                .with_unbounded_history()
-                                .build_sync(&mut io)
-                                .unwrap();
-
-                            while let Ok(s) = editor.readline(prompt, &mut io) {
-                                string_tx.send(s.to_string()).unwrap();
-                            }
-                        })
-                    },
-                )
-            }
-        }
-    }
-}
-
-#[cfg(any(test, feature = "embedded"))]
 pub mod embedded {
     //! IO implementation using traits from [`embedded_hal::serial`]. Requires feature `embedded`.
 
     use core::fmt;
 
     use embedded_hal::serial;
-    use nb::block;
+
+    macro_rules! ablock {
+        ($co:expr, $e:expr) => {
+            loop {
+                match $e {
+                    Ok(v) => break Ok(v),
+                    Err(::nb::Error::WouldBlock) => $co.yield_(()).await,
+                    Err(::nb::Error::Other(e)) => break Err(e),
+                }
+            }
+        };
+    }
 
     use super::*;
 
@@ -470,136 +191,40 @@ pub mod embedded {
         pub fn inner(&mut self) -> &mut RW {
             &mut self.rw
         }
-    }
 
-    impl<RW> Read for IO<RW>
-    where
-        RW: serial::Read<u8> + serial::Write<u8>,
-    {
-        type Error = <RW as serial::Read<u8>>::Error;
-
-        fn read(&mut self) -> Result<u8, Self::Error> {
-            block!(self.rw.read())
+        pub async fn read(
+            &mut self,
+            co: &mut Co<'_, ()>,
+        ) -> Result<u8, <RW as serial::Read<u8>>::Error> {
+            ablock!(co, self.rw.read())
         }
-    }
 
-    impl<RW> Write for IO<RW>
-    where
-        RW: serial::Read<u8> + serial::Write<u8>,
-    {
-        type Error = <RW as serial::Write<u8>>::Error;
-
-        fn write(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+        pub async fn write(
+            &mut self,
+            co: &mut Co<'_, ()>,
+            buf: &[u8],
+        ) -> Result<(), <RW as serial::Write<u8>>::Error> {
             for &b in buf {
-                block!(self.rw.write(b))?;
+                ablock!(co, self.rw.write(b))?;
             }
 
             Ok(())
         }
 
-        fn flush(&mut self) -> Result<(), Self::Error> {
-            block!(self.rw.flush())
+        pub async fn flush(
+            &mut self,
+            co: &mut Co<'_, ()>,
+        ) -> Result<(), <RW as serial::Write<u8>>::Error> {
+            ablock!(co, self.rw.flush())
         }
     }
 
-    impl<RW> fmt::Write for IO<RW>
-    where
-        RW: serial::Read<u8> + serial::Write<u8>,
-    {
-        fn write_str(&mut self, s: &str) -> fmt::Result {
-            self.write(s.as_bytes()).or(Err(fmt::Error))
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use ::std::string::ToString;
-        use ::std::{thread, vec::Vec};
-
-        use crossbeam::channel::{Receiver, Sender, TryRecvError};
-
-        use crate::builder::EditorBuilder;
-        use crate::testlib::test_editor_with_case;
-        use crate::testlib::{test_cases, MockTerminal};
-
-        use super::*;
-
-        struct MockSerial {
-            rx: Receiver<u8>,
-            buffer: Vec<u8>,
-            tx: Sender<u8>,
-        }
-
-        impl MockSerial {
-            fn new(tx: Sender<u8>, rx: Receiver<u8>) -> Self {
-                Self {
-                    rx,
-                    buffer: Vec::new(),
-                    tx,
-                }
-            }
-
-            fn from_terminal(terminal: &mut MockTerminal) -> Self {
-                let (tx, rx) = terminal.take_io();
-                Self::new(tx.unwrap(), rx)
-            }
-        }
-
-        impl serial::Read<u8> for MockSerial {
-            type Error = ();
-
-            fn read(&mut self) -> nb::Result<u8, Self::Error> {
-                match self.rx.try_recv() {
-                    Ok(byte) => Ok(byte),
-                    Err(err) => match err {
-                        TryRecvError::Empty => Err(nb::Error::WouldBlock),
-                        TryRecvError::Disconnected => Err(nb::Error::Other(())),
-                    },
-                }
-            }
-        }
-
-        impl serial::Write<u8> for MockSerial {
-            type Error = ();
-
-            fn write(&mut self, word: u8) -> nb::Result<(), Self::Error> {
-                self.buffer.push(word);
-                Ok(())
-            }
-
-            fn flush(&mut self) -> nb::Result<(), Self::Error> {
-                for byte in self.buffer.drain(0..) {
-                    self.tx.send(byte).unwrap();
-                }
-
-                Ok(())
-            }
-        }
-
-        #[test]
-        fn test_editor() {
-            let prompt = "> ";
-
-            for case in test_cases() {
-                test_editor_with_case(
-                    case,
-                    prompt,
-                    |term| MockSerial::from_terminal(term),
-                    |serial, string_tx| {
-                        thread::spawn(move || {
-                            let mut io = IO::new(serial);
-                            let mut editor = EditorBuilder::new_static::<100>()
-                                .with_static_history::<128>()
-                                .build_sync(&mut io)
-                                .unwrap();
-
-                            while let Ok(s) = editor.readline(prompt, &mut io) {
-                                string_tx.send(s.to_string()).unwrap();
-                            }
-                        })
-                    },
-                )
-            }
-        }
-    }
+    // impl<RW> fmt::Write for IO<RW>
+    // where
+    //     RW: serial::Read<u8> + serial::Write<u8>,
+    // {
+    //     fn write_str(&mut self, s: &str) -> fmt::Result {
+    //         self.write(s.as_bytes()).or(Err(fmt::Error))
+    //     }
+    // }
 }

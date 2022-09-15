@@ -69,7 +69,6 @@ pub mod error;
 pub mod history;
 mod input;
 pub mod line_buffer;
-pub mod no_sync;
 mod output;
 pub mod sync;
 pub(crate) mod terminal;

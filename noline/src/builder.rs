@@ -2,24 +2,14 @@
 
 use core::marker::PhantomData;
 
+use genawaiter::stack::Co;
+
 use crate::{
     error::Error,
     history::{History, NoHistory, StaticHistory},
     line_buffer::{Buffer, NoBuffer, StaticBuffer},
-    sync::{self, Read, Write},
+    sync::{self, Read, Write, embedded::IO},
 };
-
-#[cfg(any(test, feature = "alloc", feature = "std"))]
-use crate::line_buffer::UnboundedBuffer;
-
-#[cfg(any(test, feature = "alloc", feature = "std"))]
-use crate::history::UnboundedHistory;
-
-#[cfg(any(test, doc, feature = "tokio"))]
-use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-#[cfg(any(test, doc, feature = "tokio"))]
-use crate::no_sync;
 
 /// Builder for [`sync::Editor`] and [`no_sync::tokio::Editor`].
 ///
@@ -62,21 +52,6 @@ impl EditorBuilder<NoBuffer, NoHistory> {
             _marker: PhantomData,
         }
     }
-
-    #[cfg(any(test, feature = "alloc", feature = "std"))]
-    /// Create builder for editor with unbounded buffer
-    ///
-    /// # Example
-    /// ```
-    /// use noline::builder::EditorBuilder;
-    ///
-    /// let builder = EditorBuilder::new_unbounded();
-    /// ```
-    pub fn new_unbounded() -> EditorBuilder<UnboundedBuffer, NoHistory> {
-        EditorBuilder {
-            _marker: PhantomData,
-        }
-    }
 }
 
 impl<B: Buffer, H: History> EditorBuilder<B, H> {
@@ -87,32 +62,15 @@ impl<B: Buffer, H: History> EditorBuilder<B, H> {
         }
     }
 
-    #[cfg(any(test, feature = "alloc", feature = "std"))]
-    /// Add unbounded history
-    pub fn with_unbounded_history(self) -> EditorBuilder<B, UnboundedHistory> {
-        EditorBuilder {
-            _marker: PhantomData,
-        }
-    }
-
     /// Build [`sync::Editor`]. Is equivalent of calling [`sync::Editor::new()`].
-    pub fn build_sync<IO, RE, WE>(
+    pub async fn build_sync<RW, RE, WE>(
         self,
-        io: &mut IO,
-    ) -> Result<sync::Editor<B, H, IO>, Error<RE, WE>>
+        co: &mut Co<'_, ()>,
+        io: &mut IO<RW>,
+    ) -> Result<sync::Editor<B, H, RW>, Error<RE, WE>>
     where
-        IO: Read<Error = RE> + Write<Error = WE>,
+        RW: embedded_hal::serial::Read<u8, Error = RE> + embedded_hal::serial::Write<u8, Error = WE>,
     {
-        sync::Editor::new(io)
-    }
-
-    #[cfg(any(test, doc, feature = "tokio"))]
-    /// Build [`no_sync::tokio::Editor`]. Is equivalent of calling [`no_sync::tokio::Editor::new()`].
-    pub async fn build_async_tokio<W: AsyncWriteExt + Unpin, R: AsyncReadExt + Unpin>(
-        self,
-        stdin: &mut R,
-        stdout: &mut W,
-    ) -> Result<no_sync::tokio::Editor<B, H>, Error<std::io::Error, std::io::Error>> {
-        no_sync::tokio::Editor::new(stdin, stdout).await
+        sync::Editor::new(co, io).await
     }
 }
