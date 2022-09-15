@@ -155,7 +155,10 @@ pub mod embedded {
     macro_rules! ablock {
         ($co:expr, $e:expr) => {
             loop {
-                match $e {
+                let v = {
+                    $e
+                };
+                match v {
                     Ok(v) => break Ok(v),
                     Err(::nb::Error::WouldBlock) => $co.yield_(()).await,
                     Err(::nb::Error::Other(e)) => break Err(e),
