@@ -66,7 +66,7 @@ impl<B: Buffer, H: History> EditorBuilder<B, H> {
     pub async fn build_sync<RW, RE, WE>(
         self,
         co: &mut Co<'_, ()>,
-        io: &mut IO<RW>,
+        io: &mut IO<'_, RW>,
     ) -> Result<sync::Editor<B, H, RW>, Error<RE, WE>>
     where
         RW: embedded_hal::serial::Read<u8, Error = RE> + embedded_hal::serial::Write<u8, Error = WE>,

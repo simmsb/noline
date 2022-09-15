@@ -55,7 +55,7 @@ where
     /// Create and initialize line editor
     pub async fn new(
         co: &mut Co<'_, ()>,
-        io: &mut embedded::IO<RW>,
+        io: &mut embedded::IO<'_, RW>,
     ) -> Result<Self, Error<RE, WE>> {
         let mut initializer = Initializer::new();
 
@@ -85,7 +85,7 @@ where
     async fn handle_output<'b>(
         co: &mut Co<'_, ()>,
         output: Output<'b, B>,
-        io: &mut embedded::IO<RW>,
+        io: &mut embedded::IO<'_, RW>,
     ) -> Result<Option<()>, Error<RE, WE>> {
         for item in output {
             if let Some(bytes) = item.get_bytes() {
@@ -111,7 +111,7 @@ where
         &'b mut self,
         co: &mut Co<'_, ()>,
         prompt: &'b str,
-        io: &mut embedded::IO<RW>,
+        io: &mut embedded::IO<'_, RW>,
     ) -> Result<&'b str, Error<RE, WE>> {
         let mut line = Line::new(
             prompt,
@@ -148,7 +148,7 @@ where
 pub mod embedded {
     //! IO implementation using traits from [`embedded_hal::serial`]. Requires feature `embedded`.
 
-    use core::fmt;
+    use core::cell::RefCell;
 
     use embedded_hal::serial;
 
@@ -167,36 +167,26 @@ pub mod embedded {
     use super::*;
 
     /// IO wrapper for [`embedded_hal::serial::Read`] and [`embedded_hal::serial::Write`]
-    pub struct IO<RW>
+    pub struct IO<'a, RW>
     where
         RW: serial::Read<u8> + serial::Write<u8>,
     {
-        rw: RW,
+        rw: &'a RefCell<RW>,
     }
 
-    impl<RW> IO<RW>
+    impl<'a, RW> IO<'a, RW>
     where
         RW: serial::Read<u8> + serial::Write<u8>,
     {
-        pub fn new(rw: RW) -> Self {
+        pub fn new(rw: &'a RefCell<RW>) -> Self {
             Self { rw }
-        }
-
-        /// Consume self and return wrapped object
-        pub fn take(self) -> RW {
-            self.rw
-        }
-
-        /// Return mutable reference to wrapped object
-        pub fn inner(&mut self) -> &mut RW {
-            &mut self.rw
         }
 
         pub async fn read(
             &mut self,
             co: &mut Co<'_, ()>,
         ) -> Result<u8, <RW as serial::Read<u8>>::Error> {
-            ablock!(co, self.rw.read())
+            ablock!(co, self.rw.borrow_mut().read())
         }
 
         pub async fn write(
@@ -205,7 +195,7 @@ pub mod embedded {
             buf: &[u8],
         ) -> Result<(), <RW as serial::Write<u8>>::Error> {
             for &b in buf {
-                ablock!(co, self.rw.write(b))?;
+                ablock!(co, self.rw.borrow_mut().write(b))?;
             }
 
             Ok(())
@@ -215,7 +205,7 @@ pub mod embedded {
             &mut self,
             co: &mut Co<'_, ()>,
         ) -> Result<(), <RW as serial::Write<u8>>::Error> {
-            ablock!(co, self.rw.flush())
+            ablock!(co, self.rw.borrow_mut().flush())
         }
     }
 
